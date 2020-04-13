@@ -201,10 +201,10 @@ with torch.no_grad():
 
 ##### 过程解释
 
-1. 当我们执行z.backward()的时候。这个操作将调用z里面的grad_fn这个属性，执行求导的操作。
-2. 这个操作将遍历grad_fn的next_functions，然后分别取出里面的Function（AccumulateGrad），执行求导操作。这部分是一个递归的过程直到最后类型为叶子节点。
-3. 计算出结果以后，将结果保存到他们对应的variable 这个变量所引用的对象（x和y）的 grad这个属性里面。
-4. 求导结束。所有的叶节点的grad变量都得到了相应的更新。
+1. **当我们执行z.backward()的时候。这个操作将调用z里面的grad_fn这个属性，执行求导的操作。**
+2. **这个操作将遍历grad_fn的next_functions，然后分别取出里面的Function（AccumulateGrad），执行求导操作。这部分是一个递归的过程直到最后类型为叶子节点。注：`grad_fn.next_functions`  本节点接收的上级节点的`grad_fn`** 
+3. **计算出结果以后，将结果保存到他们对应的variable 这个变量所引用的对象（x和y）的 grad这个属性里面。**
+4. **求导结束。所有的叶节点的grad变量都得到了相应的更新。**
 
 ##### 原理解释
 
@@ -230,17 +230,166 @@ with torch.no_grad():
 5. 将梯度反向传播回网络的参数；
 6. 更新网络的参数，主要使用如下简单的更新原则： `weight = weight - learning_rate * gradient`
 
-##### 定义forward函数
+##### 定义forward函数（就是定义网络怎么向前传输的）
 
 在模型中必须要定义 `forward` 函数，`backward` 函数（用来计算梯度）会被`autograd`自动创建。 可以在 `forward` 函数中使用任何针对 Tensor 的操作。
 
+`net.parameters()`返回可被学习的参数（权重）列表和值。
+
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
 
-##### 被学习的参数列表和值
+class Net(nn.Module):
+
+    def __init__(self):
+        super(Net, self).__init__()
+        # 1 input image channel, 6 output channels, 5x5 square convolution
+        # kernel
+        self.conv1 = nn.Conv2d(1, 6, 5)
+        self.conv2 = nn.Conv2d(6, 16, 5)
+        # an affine operation: y = Wx + b
+        self.fc1 = nn.Linear(16 * 5 * 5, 120)
+        self.fc2 = nn.Linear(120, 84)
+        self.fc3 = nn.Linear(84, 10)
+
+    def forward(self, x):
+        # Max pooling over a (2, 2) window
+        x = F.max_pool2d(F.relu(self.conv1(x)), (2, 2))
+        # If the size is a square you can only specify a single number
+        x = F.max_pool2d(F.relu(self.conv2(x)), 2)
+        x = x.view(-1, self.num_flat_features(x))
+        x = F.relu(self.fc1(x))
+        x = F.relu(self.fc2(x))
+        x = self.fc3(x)
+        return x
+
+    def num_flat_features(self, x):
+        size = x.size()[1:]  # all dimensions except the batch dimension
+        num_features = 1
+        for s in size:
+            num_features *= s
+        return num_features
 
 
+net = Net()
+print(net)
+```
 
+##### 测试输出
 
+J说明就是建立的时候，其中参数有随机值，那么输入之后，就能计算输出了。
+
+```python
+input = torch.randn(1, 1, 32, 32)
+out = net(input)
+print(out)
+#tensor([[ 0.1120,  0.0713,  0.1014, -0.0696, -0.1210,  0.0084, -0.0206,  0.1366, -0.0455, -0.0036]], grad_fn=<AddmmBackward>)
+```
+
+##### 损失函数criterion
+
+一个损失函数接受一对 (output, target) 作为输入，计算一个值来估计网络的输出和目标值相差多少。
+
+**译者注：output为网络的输出，target为实际值**
+
+ ```python
+output = net(input) 
+target = torch.randn(10)  # 随机值作为样例
+target = target.view(1, -1)  # 使target和output的shape相同
+criterion = nn.MSELoss()
+
+loss = criterion(output, target)
+print(loss)
+#tensor(0.8109, grad_fn=<MseLossBackward>)
+ ```
+
+######Function
+
+节点就是参与运算的变量 。**节点=变量**
+
+对变量的操作抽象为`Function` 。
+
+类AccumulateGrad，继承自Function，是一个Function实例。
+
+######grad_fn
+
+`grad_fn.next_functions`  本节点接收的上级节点的`grad_fn` ，**是一个tuple of tuple of `AccumulateGrad` and `int`，所以下面会采用`next_functions[0][0]`去取得上级节点的Function实例** ，以下以例子说明：
+
+grad_fn  指向创建Tensor的Function，如果某一个对象由用户创建，则指向None。
+
+######叶节点
+
+对于那些不是任何函数(Function)的输出，由用户创建的节点称为叶子节点，叶子节点的`grad_fn`为None。**叶子节点中需要求导的variable，具有`AccumulateGrad`标识，因其梯度是累加的。** J注意下面的`a`并非是用户创建，也是由函数输出，因此不是叶子节点。
+
+叶节点  由用户创建的计算图Variable对象，反向传播后会保留梯度grad数值，其他Variable会清空为None 。
+
+```python
+print(loss.grad_fn)  # MSELoss
+print(loss.grad_fn.next_functions[0][0])  # Linear
+print(loss.grad_fn.next_functions[0][0].next_functions[0][0])  # ReLU
+#<MseLossBackward object at 0x7f3b49fe2470>
+#<AddmmBackward object at 0x7f3bb05f17f0>
+#<AccumulateGrad object at 0x7f3b4a3c34e0>
+```
+
+```python
+a = torch.randn(1, requires_grad=True)
+b = a*(a+2)
+print (b.grad_fn.next_functions)
+print (b.grad_fn.next_functions[1][0].next_functions)
+print (b.grad_fn.next_functions[0][0].variable is a)
+#((<AccumulateGrad object at 0x7fbe7aa96780>, 0), (<AddBackward0 object at 0x7fbe7aa96748>, 0))
+#((<AccumulateGrad object at 0x7fbe7aa96780>, 0), (None, 0))
+#True
+```
+
+##### 反向传播loss.backward
+
+调用loss.backward()获得反向传播的误差。
+
+但是在调用前需要清除已存在的梯度，否则梯度将被累加到已存在的梯度。
+
+现在，我们将调用loss.backward()，并查看conv1层的偏差（bias）项在反向传播前后的梯度。
+
+```python
+net.zero_grad()     # 清除梯度
+
+print('conv1.bias.grad before backward')
+print(net.conv1.bias.grad)
+
+loss.backward()
+
+print('conv1.bias.grad after backward')
+print(net.conv1.bias.grad)
+```
+
+```linux
+conv1.bias.grad before backward
+tensor([0., 0., 0., 0., 0., 0.])
+conv1.bias.grad after backward
+tensor([ 0.0051,  0.0042,  0.0026,  0.0152, -0.0040, -0.0036])
+```
+
+##### 更新权重optimizer
+
+当使用神经网络是想要使用各种不同的更新规则时，比如SGD、Nesterov-SGD、Adam、RMSPROP等，PyTorch中构建了一个包`torch.optim`实现了所有的这些规则。 使用它们非常简单： 
+
+```python
+import torch.optim as optim
+
+# create your optimizer
+optimizer = optim.SGD(net.parameters(), lr=0.01)
+
+# in your training loop:
+optimizer.zero_grad()   # zero the gradient buffers
+output = net(input)
+loss = criterion(output, target)
+loss.backward()
+optimizer.step()    # Does the update
+```
 
 
 
@@ -265,5 +414,6 @@ tensor([[ 1., 1., 1.],
 
 ## Reference
 
+- [pytorch handbook ](https://github.com/zergtant/pytorch-handbook )
 - [PyTorch还是TensorFlow？这有一份新手深度学习框架选择指南](https://zhuanlan.zhihu.com/p/28636490)
 - [详解Pytorch 自动微分里的（vector-Jacobian product）](https://zhuanlan.zhihu.com/p/65609544)
