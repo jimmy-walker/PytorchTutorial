@@ -346,6 +346,8 @@ print (b.grad_fn.next_functions[0][0].variable is a)
 #True
 ```
 
+**J等于这里展示了`b.grad_fn.next_functions`会有多个对象，因为`a*(a+2)`，所以对应`a`和`a+2`，而进一步，由于是用户创建的叶子节点，所以`2`的grad_fn为None**
+
 ##### 反向传播loss.backward
 
 调用loss.backward()获得反向传播的误差。
